@@ -1,0 +1,242 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: oci-push
+  labels:
+    app.kubernetes.io/version: "0.4"
+  annotations:
+    tekton.dev/displayName: "OCI Push"
+    tekton.dev/categories: Image Build
+spec:
+  description: >-
+    Packages rendered Kubernetes manifests as an OCI artifact and
+    pushes to a container registry using ORAS. Produces an artifact
+    compatible with Argo CD OCI source consumption (single tar+gzip
+    layer). Supports revision tracking via content-addressable tags,
+    parent digest chaining, and commit messages.
+  workspaces:
+    - name: source
+      description: >-
+        Workspace containing the rendered manifests in the
+        _rendered/ subdirectory (or as specified by RENDERED_DIR).
+  params:
+    - name: IMAGE_REF
+      description: >-
+        Full OCI image reference including tag, e.g.
+        registry.example.com/org/app-manifests:v1.0.0
+      type: string
+    - name: MEDIA_TYPE
+      description: >-
+        OCI layer media type. Must be accepted by Argo CD repo-server.
+      type: string
+      default: "application/vnd.oci.image.layer.v1.tar+gzip"
+    - name: RENDERED_DIR
+      description: >-
+        Subdirectory within the workspace containing rendered manifests.
+      type: string
+      default: "_rendered"
+    - name: EXTRA_TAGS
+      description: >-
+        Comma-separated additional tags to apply after push, e.g.
+        "latest,stable". Leave empty to skip.
+      type: string
+      default: ""
+    - name: ANNOTATION_SOURCE_REPO
+      description: Source git repository URL for provenance tracking.
+      type: string
+      default: ""
+    - name: ANNOTATION_SOURCE_REVISION
+      description: Source git commit SHA for provenance tracking.
+      type: string
+      default: ""
+    - name: ANNOTATION_MANIFEST_SHA
+      description: SHA-256 of the rendered manifests for integrity verification.
+      type: string
+      default: ""
+    - name: ANNOTATION_PARENT_DIGEST
+      description: >-
+        Digest of the previous artifact in the revision chain.
+        Enables Kokumi-style revision chaining for rollback support.
+      type: string
+      default: ""
+    - name: ANNOTATION_COMMIT_MESSAGE
+      description: >-
+        Human-readable description of why this artifact was created.
+        Stored as an OCI annotation for audit trail.
+      type: string
+      default: ""
+    - name: ANNOTATION_RENDERER_IMAGE
+      description: >-
+        Container image used for rendering (e.g., alpine/k8s:1.30.2).
+        Tracks which renderer version produced the artifact for
+        reproducibility.
+      type: string
+      default: ""
+    - name: ANNOTATION_RENDERER_VERSION
+      description: >-
+        Version of the rendering tool (e.g., helm v3.15.2 or
+        kustomize v5.4.2). Stored for reproducibility auditing.
+      type: string
+      default: ""
+    - name: ANNOTATION_RENDERER_DIGEST
+      description: >-
+        Digest of the renderer container image for exact
+        reproducibility (e.g., sha256:abc123...).
+      type: string
+      default: ""
+    - name: ANNOTATION_RENDERER_TYPE
+      description: >-
+        Type of renderer used: "helm", "kustomize", or "manifest".
+        Stored as a formal annotation for tooling compatibility.
+      type: string
+      default: ""
+  results:
+    - name: IMAGE_DIGEST
+      description: The digest (sha256:...) of the pushed OCI artifact.
+    - name: IMAGE_REF
+      description: The full image reference that was pushed.
+    - name: CONTENT_TAG
+      description: >-
+        Content-addressable tag (sha-<first12 of manifest SHA>)
+        for immutable revision lookup.
+  steps:
+    - name: push
+      image: ghcr.io/oras-project/oras:v1.2.0
+      env:
+        - name: IMAGE_REF
+          value: $(params.IMAGE_REF)
+        - name: MEDIA_TYPE
+          value: $(params.MEDIA_TYPE)
+        - name: RENDERED_DIR
+          value: $(params.RENDERED_DIR)
+        - name: EXTRA_TAGS
+          value: $(params.EXTRA_TAGS)
+        - name: ANNOTATION_SOURCE_REPO
+          value: $(params.ANNOTATION_SOURCE_REPO)
+        - name: ANNOTATION_SOURCE_REVISION
+          value: $(params.ANNOTATION_SOURCE_REVISION)
+        - name: ANNOTATION_MANIFEST_SHA
+          value: $(params.ANNOTATION_MANIFEST_SHA)
+        - name: ANNOTATION_PARENT_DIGEST
+          value: $(params.ANNOTATION_PARENT_DIGEST)
+        - name: ANNOTATION_COMMIT_MESSAGE
+          value: $(params.ANNOTATION_COMMIT_MESSAGE)
+        - name: ANNOTATION_RENDERER_IMAGE
+          value: $(params.ANNOTATION_RENDERER_IMAGE)
+        - name: ANNOTATION_RENDERER_VERSION
+          value: $(params.ANNOTATION_RENDERER_VERSION)
+        - name: ANNOTATION_RENDERER_DIGEST
+          value: $(params.ANNOTATION_RENDERER_DIGEST)
+        - name: ANNOTATION_RENDERER_TYPE
+          value: $(params.ANNOTATION_RENDERER_TYPE)
+        - name: WORKSPACE_PATH
+          value: $(workspaces.source.path)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        MANIFESTS_PATH="${WORKSPACE_PATH}/${RENDERED_DIR}"
+
+        if [ ! -d "${MANIFESTS_PATH}" ]; then
+          echo "ERROR: Rendered manifests directory not found: ${MANIFESTS_PATH}"
+          exit 1
+        fi
+
+        FILE_COUNT=$(find "${MANIFESTS_PATH}" -type f \( -name '*.yaml' -o -name '*.yml' -o -name '*.json' \) | wc -l | tr -d ' ')
+        if [ "${FILE_COUNT}" = "0" ]; then
+          echo "ERROR: No manifest files found in ${MANIFESTS_PATH}"
+          exit 1
+        fi
+        echo "Found ${FILE_COUNT} manifest file(s) to package."
+
+        # Package as a single gzipped tar archive (Argo CD requires exactly one content layer)
+        ARCHIVE_PATH="/tmp/manifests.tar.gz"
+        tar -czf "${ARCHIVE_PATH}" -C "${MANIFESTS_PATH}" .
+        ARCHIVE_SIZE=$(wc -c < "${ARCHIVE_PATH}" | tr -d ' ')
+        echo "Archive size: ${ARCHIVE_SIZE} bytes"
+
+        # Build annotation flags
+        ANNOTATION_FLAGS=""
+        if [ -n "${ANNOTATION_SOURCE_REPO}" ]; then
+          ANNOTATION_FLAGS="${ANNOTATION_FLAGS} --annotation org.opencontainers.image.source=${ANNOTATION_SOURCE_REPO}"
+        fi
+        if [ -n "${ANNOTATION_SOURCE_REVISION}" ]; then
+          ANNOTATION_FLAGS="${ANNOTATION_FLAGS} --annotation org.opencontainers.image.revision=${ANNOTATION_SOURCE_REVISION}"
+        fi
+        if [ -n "${ANNOTATION_MANIFEST_SHA}" ]; then
+          ANNOTATION_FLAGS="${ANNOTATION_FLAGS} --annotation dev.tekton.manifests.sha256=${ANNOTATION_MANIFEST_SHA}"
+        fi
+        if [ -n "${ANNOTATION_PARENT_DIGEST}" ]; then
+          ANNOTATION_FLAGS="${ANNOTATION_FLAGS} --annotation dev.kokumi.parent.digest=${ANNOTATION_PARENT_DIGEST}"
+        fi
+        if [ -n "${ANNOTATION_COMMIT_MESSAGE}" ]; then
+          ANNOTATION_FLAGS="${ANNOTATION_FLAGS} --annotation dev.kokumi.commit.message=${ANNOTATION_COMMIT_MESSAGE}"
+        fi
+        if [ -n "${ANNOTATION_RENDERER_IMAGE}" ]; then
+          ANNOTATION_FLAGS="${ANNOTATION_FLAGS} --annotation dev.tekton.renderer.image=${ANNOTATION_RENDERER_IMAGE}"
+        fi
+        if [ -n "${ANNOTATION_RENDERER_VERSION}" ]; then
+          ANNOTATION_FLAGS="${ANNOTATION_FLAGS} --annotation dev.tekton.renderer.version=${ANNOTATION_RENDERER_VERSION}"
+        fi
+        if [ -n "${ANNOTATION_RENDERER_DIGEST}" ]; then
+          ANNOTATION_FLAGS="${ANNOTATION_FLAGS} --annotation dev.tekton.renderer.digest=${ANNOTATION_RENDERER_DIGEST}"
+        fi
+        if [ -n "${ANNOTATION_RENDERER_TYPE}" ]; then
+          ANNOTATION_FLAGS="${ANNOTATION_FLAGS} --annotation dev.tekton.renderer.type=${ANNOTATION_RENDERER_TYPE}"
+        fi
+        ANNOTATION_FLAGS="${ANNOTATION_FLAGS} --annotation org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+        echo "Pushing OCI artifact: ${IMAGE_REF}"
+        echo "Layer media type: ${MEDIA_TYPE}"
+
+        # Push with explicit media type via filename:mediatype syntax
+        OUTPUT=$(oras push ${ANNOTATION_FLAGS} \
+          "${IMAGE_REF}" \
+          "${ARCHIVE_PATH}:${MEDIA_TYPE}" 2>&1)
+
+        echo "${OUTPUT}"
+
+        DIGEST=$(echo "${OUTPUT}" | grep -oE 'sha256:[a-f0-9]{64}' | tail -1)
+
+        if [ -z "${DIGEST}" ]; then
+          echo "ERROR: Failed to extract digest from oras push output."
+          exit 1
+        fi
+
+        # Content-addressable tag: sha-<first 12 chars of manifest SHA>
+        CONTENT_TAG=""
+        if [ -n "${ANNOTATION_MANIFEST_SHA}" ]; then
+          SHORT_SHA=$(echo "${ANNOTATION_MANIFEST_SHA}" | cut -c1-12)
+          CONTENT_TAG="sha-${SHORT_SHA}"
+
+          # Extract base image path (everything before the last colon/tag)
+          BASE_IMAGE=$(echo "${IMAGE_REF}" | sed 's/:[^:]*$//')
+
+          echo "Tagging with content-addressable tag: ${CONTENT_TAG}"
+          oras tag "${BASE_IMAGE}:${IMAGE_REF##*:}" "${CONTENT_TAG}" 2>&1 || \
+            echo "WARNING: Failed to apply content tag, continuing."
+        fi
+
+        # Apply extra tags
+        if [ -n "${EXTRA_TAGS}" ]; then
+          BASE_IMAGE=$(echo "${IMAGE_REF}" | sed 's/:[^:]*$//')
+          CURRENT_TAG="${IMAGE_REF##*:}"
+
+          echo "${EXTRA_TAGS}" | tr ',' '\n' | while read -r TAG; do
+            TAG=$(echo "${TAG}" | tr -d ' ')
+            if [ -n "${TAG}" ]; then
+              echo "Applying extra tag: ${TAG}"
+              oras tag "${BASE_IMAGE}:${CURRENT_TAG}" "${TAG}" 2>&1 || \
+                echo "WARNING: Failed to apply tag ${TAG}, continuing."
+            fi
+          done
+        fi
+
+        printf "%s" "${DIGEST}" > "$(results.IMAGE_DIGEST.path)"
+        printf "%s" "${IMAGE_REF}" > "$(results.IMAGE_REF.path)"
+        printf "%s" "${CONTENT_TAG}" > "$(results.CONTENT_TAG.path)"
+
+        echo "Pushed ${IMAGE_REF} @ ${DIGEST}"
+        if [ -n "${CONTENT_TAG}" ]; then
+          echo "Content tag: ${CONTENT_TAG}"
+        fi

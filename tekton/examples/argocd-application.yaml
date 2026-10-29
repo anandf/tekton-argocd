@@ -1,0 +1,25 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    # OCI source: Argo CD resolves the tag to a digest, pulls the
+    # single tar+gzip layer, extracts it, and treats the contents
+    # as a plain YAML directory source.
+    repoURL: oci://registry.example.com/manifests/my-app
+    targetRevision: "v1.2.3"
+    path: "."
+    directory:
+      recurse: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

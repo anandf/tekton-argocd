@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - task-check-drift.yaml
+  - task-hydrate.yaml
+  - task-oci-pull.yaml
+  - task-oci-push.yaml
+  - task-patch.yaml
+  - task-promote.yaml
+  - task-sign.yaml

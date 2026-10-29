@@ -1,0 +1,46 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: hydrate-kustomize-
+  labels:
+    tekton.dev/pipeline: hydrate-and-push
+spec:
+  pipelineRef:
+    name: hydrate-and-push
+  taskRunTemplate:
+    serviceAccountName: tekton-oci-push
+  workspaces:
+    - name: shared-workspace
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1Gi
+  params:
+    - name: git-url
+      value: "https://github.com/example-org/k8s-manifests.git"
+    - name: git-revision
+      value: "main"
+    - name: hydration-method
+      value: "kustomize"
+    - name: kustomize-path
+      value: "overlays/production"
+    - name: image-ref
+      value: "registry.example.com/manifests/my-app:v1.2.3"
+    - name: extra-tags
+      value: "latest"
+    - name: commit-message
+      value: "Release v1.2.3 from kustomize production overlay"
+    - name: patches
+      value: "[]"
+    - name: renderer-type
+      value: "kustomize"
+    # Drift detection and signing disabled for simplicity
+    - name: skip-on-no-drift
+      value: "false"
+    - name: sign
+      value: "false"
+    - name: promote
+      value: "false"

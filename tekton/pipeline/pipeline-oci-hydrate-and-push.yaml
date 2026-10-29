@@ -1,0 +1,275 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: oci-hydrate-and-push
+  labels:
+    app.kubernetes.io/version: "0.3"
+  annotations:
+    tekton.dev/displayName: "OCI-to-OCI Hydrate and Push"
+spec:
+  description: >-
+    Full OCI-to-OCI pipeline: pulls a source OCI artifact, hydrates
+    manifests (Helm/Kustomize), applies JSONPath patches, pushes as
+    a new OCI artifact with revision tracking, optionally signs with
+    cosign, and promotes the Argo CD Application.
+  workspaces:
+    - name: shared-workspace
+      description: >-
+        Shared workspace across all tasks. OCI source is extracted
+        here, manifests rendered to _rendered/, and OCI push reads
+        from it.
+    - name: cosign-key
+      description: >-
+        Optional workspace for cosign private key. Only needed when
+        signing-mode is "key".
+      optional: true
+  params:
+    # OCI source parameters
+    - name: oci-source-ref
+      description: >-
+        Full OCI image reference to pull as source, e.g.
+        registry.example.com/charts/my-app:v1.0.0
+      type: string
+
+    # Hydration parameters
+    - name: hydration-method
+      description: "Hydration tool: 'helm' or 'kustomize'."
+      type: string
+
+    # Helm-specific parameters
+    - name: helm-chart-path
+      description: Path to Helm chart directory within the extracted artifact.
+      type: string
+      default: "."
+    - name: helm-release-name
+      description: Helm release name for template rendering.
+      type: string
+      default: "release"
+    - name: helm-namespace
+      description: Target namespace for Helm template.
+      type: string
+      default: "default"
+    - name: helm-values-file
+      description: Path to Helm values file within the extracted artifact.
+      type: string
+      default: ""
+    - name: helm-values
+      description: Inline YAML values for Helm template.
+      type: string
+      default: ""
+    - name: helm-include-crds
+      description: >-
+        Set to "true" to include CRDs in Helm output, "false" to exclude.
+      type: string
+      default: "true"
+    - name: helm-skip-tests
+      description: >-
+        Set to "true" to skip Helm test hooks in output.
+      type: string
+      default: "true"
+
+    # Kustomize-specific parameters
+    - name: kustomize-path
+      description: Path to kustomization directory within the extracted artifact.
+      type: string
+      default: "."
+
+    # Patch parameters
+    - name: patches
+      description: >-
+        JSON array of post-render patches. Pass "[]" to skip.
+      type: string
+      default: "[]"
+
+    # OCI push parameters
+    - name: image-ref
+      description: >-
+        Full OCI image reference for the output, e.g.
+        registry.example.com/manifests/my-app:v1.0.0
+      type: string
+    - name: extra-tags
+      description: >-
+        Comma-separated additional tags, e.g. "latest,stable".
+      type: string
+      default: ""
+    - name: parent-digest
+      description: >-
+        Digest of the previous artifact for revision chaining.
+      type: string
+      default: ""
+    - name: commit-message
+      description: >-
+        Human-readable description of why this artifact was created.
+      type: string
+      default: ""
+    - name: renderer-type
+      description: >-
+        Formal renderer type annotation: "helm", "kustomize", or "manifest".
+      type: string
+      default: ""
+
+    # Signing parameters
+    - name: sign
+      description: >-
+        Set to "true" to sign the artifact with cosign after push.
+      type: string
+      default: "false"
+    - name: signing-mode
+      description: >-
+        "key" for key-based signing, "keyless" for Sigstore.
+      type: string
+      default: "keyless"
+
+    # Promotion parameters
+    - name: promote
+      description: >-
+        Set to "true" to update the Argo CD Application after push.
+      type: string
+      default: "false"
+    - name: promote-app-name
+      description: Name of the Argo CD Application to update.
+      type: string
+      default: ""
+    - name: promote-app-namespace
+      description: Namespace of the Argo CD Application.
+      type: string
+      default: "argocd"
+    - name: set-sync-policy
+      description: >-
+        Set to "true" to configure automated sync policy on the Application.
+      type: string
+      default: "false"
+
+  results:
+    - name: source-digest
+      description: Resolved digest of the source OCI artifact.
+      value: $(tasks.pull.results.digest)
+    - name: manifest-sha
+      description: SHA-256 of the final manifests (after patching).
+      value: $(tasks.patch.results.MANIFEST_SHA)
+    - name: image-digest
+      description: OCI digest of the pushed artifact.
+      value: $(tasks.push.results.IMAGE_DIGEST)
+    - name: content-tag
+      description: Content-addressable tag (sha-<12chars>).
+      value: $(tasks.push.results.CONTENT_TAG)
+
+  tasks:
+    - name: pull
+      taskRef:
+        name: oci-pull
+      workspaces:
+        - name: output
+          workspace: shared-workspace
+      params:
+        - name: SOURCE_IMAGE_REF
+          value: $(params.oci-source-ref)
+
+    - name: hydrate
+      taskRef:
+        name: hydrate-manifests
+      runAfter:
+        - pull
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+      params:
+        - name: HYDRATION_METHOD
+          value: $(params.hydration-method)
+        - name: HELM_CHART_PATH
+          value: $(params.helm-chart-path)
+        - name: HELM_RELEASE_NAME
+          value: $(params.helm-release-name)
+        - name: HELM_NAMESPACE
+          value: $(params.helm-namespace)
+        - name: HELM_VALUES_FILE
+          value: $(params.helm-values-file)
+        - name: HELM_VALUES
+          value: $(params.helm-values)
+        - name: HELM_INCLUDE_CRDS
+          value: $(params.helm-include-crds)
+        - name: HELM_SKIP_TESTS
+          value: $(params.helm-skip-tests)
+        - name: KUSTOMIZE_PATH
+          value: $(params.kustomize-path)
+
+    - name: patch
+      taskRef:
+        name: patch-manifests
+      runAfter:
+        - hydrate
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+      params:
+        - name: PATCHES
+          value: $(params.patches)
+
+    - name: push
+      taskRef:
+        name: oci-push
+      runAfter:
+        - patch
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+      params:
+        - name: IMAGE_REF
+          value: $(params.image-ref)
+        - name: EXTRA_TAGS
+          value: $(params.extra-tags)
+        - name: ANNOTATION_SOURCE_REPO
+          value: $(params.oci-source-ref)
+        - name: ANNOTATION_SOURCE_REVISION
+          value: $(tasks.pull.results.digest)
+        - name: ANNOTATION_MANIFEST_SHA
+          value: $(tasks.patch.results.MANIFEST_SHA)
+        - name: ANNOTATION_PARENT_DIGEST
+          value: $(params.parent-digest)
+        - name: ANNOTATION_COMMIT_MESSAGE
+          value: $(params.commit-message)
+        - name: ANNOTATION_RENDERER_IMAGE
+          value: "alpine/k8s:1.30.2"
+        - name: ANNOTATION_RENDERER_VERSION
+          value: $(params.hydration-method)
+        - name: ANNOTATION_RENDERER_TYPE
+          value: $(params.renderer-type)
+
+    - name: sign
+      taskRef:
+        name: cosign-sign
+      runAfter:
+        - push
+      when:
+        - input: $(params.sign)
+          operator: in
+          values: ["true"]
+      workspaces:
+        - name: cosign-key
+          workspace: cosign-key
+      params:
+        - name: IMAGE_REF
+          value: $(params.image-ref)
+        - name: IMAGE_DIGEST
+          value: $(tasks.push.results.IMAGE_DIGEST)
+        - name: SIGNING_MODE
+          value: $(params.signing-mode)
+
+    - name: promote
+      taskRef:
+        name: argocd-promote
+      runAfter:
+        - push
+      when:
+        - input: $(params.promote)
+          operator: in
+          values: ["true"]
+      params:
+        - name: APP_NAME
+          value: $(params.promote-app-name)
+        - name: APP_NAMESPACE
+          value: $(params.promote-app-namespace)
+        - name: TARGET_REVISION
+          value: $(tasks.push.results.CONTENT_TAG)
+        - name: SET_SYNC_POLICY
+          value: $(params.set-sync-policy)

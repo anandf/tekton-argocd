@@ -1,0 +1,158 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: patch-manifests
+  labels:
+    app.kubernetes.io/version: "0.2"
+  annotations:
+    tekton.dev/displayName: "Patch Manifests"
+    tekton.dev/categories: Build Tools
+spec:
+  description: >-
+    Applies JSONPath-based patches to rendered Kubernetes manifests,
+    targeting specific resources by kind and name. Compatible with
+    the Kokumi patch format. Uses yq to modify multi-document YAML
+    files in-place.
+  workspaces:
+    - name: source
+      description: >-
+        Workspace containing rendered manifests in the _rendered/
+        subdirectory. Manifests are modified in-place.
+  params:
+    - name: PATCHES
+      description: >-
+        JSON array of patches to apply. Each patch has a "target"
+        (kind, name, optional namespace) and "set" (map of YAML
+        paths to values). Example:
+        [{"target":{"kind":"Deployment","name":"nginx"},"set":{".spec.replicas":"3"}}]
+        Pass "[]" or "" to skip patching.
+      type: string
+      default: "[]"
+    - name: RENDERED_DIR
+      description: >-
+        Subdirectory within the workspace containing rendered manifests.
+      type: string
+      default: "_rendered"
+    - name: NORMALIZE
+      description: >-
+        Set to "true" to normalize YAML formatting for deterministic
+        content hashing, even when no patches are applied. Ensures
+        consistent SHA output regardless of renderer whitespace differences.
+      type: string
+      default: "true"
+  results:
+    - name: PATCH_COUNT
+      description: Number of patches applied.
+    - name: MANIFEST_SHA
+      description: SHA-256 digest of the manifests after patching.
+  steps:
+    - name: patch
+      image: mikefarah/yq:4
+      env:
+        - name: PATCHES
+          value: $(params.PATCHES)
+        - name: RENDERED_DIR
+          value: $(params.RENDERED_DIR)
+        - name: NORMALIZE
+          value: $(params.NORMALIZE)
+        - name: WORKSPACE_PATH
+          value: $(workspaces.source.path)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        MANIFESTS="${WORKSPACE_PATH}/${RENDERED_DIR}/manifests.yaml"
+
+        if [ ! -f "${MANIFESTS}" ]; then
+          echo "ERROR: Manifests file not found: ${MANIFESTS}"
+          exit 1
+        fi
+
+        # Handle empty or no-op patches
+        if [ -z "${PATCHES}" ] || [ "${PATCHES}" = "[]" ]; then
+          echo "No patches to apply, passing through."
+          if [ "${NORMALIZE}" = "true" ]; then
+            echo "Normalizing YAML for deterministic hashing..."
+            yq eval-all '.' -P "${MANIFESTS}" > "/tmp/normalized.yaml"
+            mv /tmp/normalized.yaml "${MANIFESTS}"
+          fi
+          printf "0" > "$(results.PATCH_COUNT.path)"
+          SHA=$(sha256sum "${MANIFESTS}" | cut -d' ' -f1)
+          printf "%s" "${SHA}" > "$(results.MANIFEST_SHA.path)"
+          echo "Manifest SHA-256: ${SHA}"
+          exit 0
+        fi
+
+        # Write patches JSON to temp file for reliable parsing
+        PATCHES_FILE="/tmp/patches.json"
+        printf '%s' "${PATCHES}" > "${PATCHES_FILE}"
+
+        PATCH_COUNT=$(yq -p json -o json 'length' "${PATCHES_FILE}")
+        echo "Applying ${PATCH_COUNT} patch(es)..."
+
+        IDX=0
+        while [ "${IDX}" -lt "${PATCH_COUNT}" ]; do
+          # Extract target fields
+          TARGET_KIND=$(yq -p json -o json -r ".[${IDX}].target.kind" "${PATCHES_FILE}")
+          TARGET_NAME=$(yq -p json -o json -r ".[${IDX}].target.name" "${PATCHES_FILE}")
+          TARGET_NS=$(yq -p json -o json -r ".[${IDX}].target.namespace // \"\"" "${PATCHES_FILE}")
+
+          echo "Patch ${IDX}: ${TARGET_KIND}/${TARGET_NAME} (namespace: ${TARGET_NS:-any})"
+
+          # Extract all set keys for this patch
+          SET_KEYS=$(yq -p json -o json -r ".[${IDX}].set | keys | .[]" "${PATCHES_FILE}")
+
+          for KEY in ${SET_KEYS}; do
+            VALUE=$(yq -p json -o json -r ".[${IDX}].set.\"${KEY}\"" "${PATCHES_FILE}")
+
+            # Strip leading dot from the path for yq syntax
+            YQ_PATH=$(echo "${KEY}" | sed 's/^\.//')
+
+            # Build the yq selector for the target document
+            if [ -n "${TARGET_NS}" ]; then
+              SELECTOR="select(.kind == \"${TARGET_KIND}\" and .metadata.name == \"${TARGET_NAME}\" and .metadata.namespace == \"${TARGET_NS}\")"
+            else
+              SELECTOR="select(.kind == \"${TARGET_KIND}\" and .metadata.name == \"${TARGET_NAME}\")"
+            fi
+
+            # Determine if value is numeric, boolean, or string
+            case "${VALUE}" in
+              true|false)
+                YQ_EXPR="(${SELECTOR} | .${YQ_PATH}) = ${VALUE}"
+                ;;
+              *[!0-9]*)
+                YQ_EXPR="(${SELECTOR} | .${YQ_PATH}) = \"${VALUE}\""
+                ;;
+              *)
+                YQ_EXPR="(${SELECTOR} | .${YQ_PATH}) = ${VALUE}"
+                ;;
+            esac
+
+            echo "  Setting ${KEY} = ${VALUE}"
+            yq eval-all "${YQ_EXPR}" -i "${MANIFESTS}"
+          done
+
+          IDX=$((IDX + 1))
+        done
+
+        # Validate output
+        if [ ! -s "${MANIFESTS}" ]; then
+          echo "ERROR: Manifests file is empty after patching."
+          exit 1
+        fi
+
+        # Normalize YAML after patching for deterministic hashing
+        if [ "${NORMALIZE}" = "true" ]; then
+          echo "Normalizing YAML for deterministic hashing..."
+          yq eval-all '.' -P "${MANIFESTS}" > "/tmp/normalized.yaml"
+          mv /tmp/normalized.yaml "${MANIFESTS}"
+        fi
+
+        printf "%s" "${PATCH_COUNT}" > "$(results.PATCH_COUNT.path)"
+
+        SHA=$(sha256sum "${MANIFESTS}" | cut -d' ' -f1)
+        printf "%s" "${SHA}" > "$(results.MANIFEST_SHA.path)"
+
+        MANIFEST_SIZE=$(wc -c < "${MANIFESTS}" | tr -d ' ')
+        echo "Patching complete. ${PATCH_COUNT} patch(es) applied."
+        echo "Output: ${MANIFEST_SIZE} bytes, SHA-256: ${SHA}"

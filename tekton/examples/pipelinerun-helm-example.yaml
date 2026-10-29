@@ -1,0 +1,77 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: hydrate-helm-
+  labels:
+    tekton.dev/pipeline: hydrate-and-push
+spec:
+  pipelineRef:
+    name: hydrate-and-push
+  taskRunTemplate:
+    serviceAccountName: tekton-oci-push
+  workspaces:
+    - name: shared-workspace
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1Gi
+  params:
+    - name: git-url
+      value: "https://github.com/example-org/k8s-manifests.git"
+    - name: git-revision
+      value: "main"
+    - name: hydration-method
+      value: "helm"
+    - name: helm-chart-path
+      value: "charts/my-app"
+    - name: helm-release-name
+      value: "my-app"
+    - name: helm-namespace
+      value: "production"
+    - name: helm-values-file
+      value: "charts/my-app/values-prod.yaml"
+    - name: helm-include-crds
+      value: "true"
+    - name: helm-skip-tests
+      value: "true"
+    - name: image-ref
+      value: "registry.example.com/manifests/my-app:v1.2.3"
+    - name: extra-tags
+      value: "latest"
+    - name: commit-message
+      value: "Release v1.2.3 with production values"
+    # Post-render patches: override replicas and image tag
+    - name: patches
+      value: |
+        [
+          {
+            "target": {"kind": "Deployment", "name": "my-app"},
+            "set": {
+              ".spec.replicas": "3",
+              ".spec.template.spec.containers[0].image": "my-app:v1.2.3"
+            }
+          }
+        ]
+    - name: renderer-type
+      value: "helm"
+    # Enable drift detection to skip re-rendering when config is unchanged
+    - name: skip-on-no-drift
+      value: "true"
+    # Sign the artifact with keyless cosign
+    - name: sign
+      value: "true"
+    - name: signing-mode
+      value: "keyless"
+    # Auto-promote: update the Argo CD Application after push
+    - name: promote
+      value: "true"
+    - name: promote-app-name
+      value: "my-app"
+    - name: promote-app-namespace
+      value: "argocd"
+    # Configure automated sync policy on the Application
+    - name: set-sync-policy
+      value: "true"

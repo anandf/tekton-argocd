@@ -1,0 +1,146 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: argocd-promote
+  labels:
+    app.kubernetes.io/version: "0.2"
+  annotations:
+    tekton.dev/displayName: "Argo CD Promote"
+    tekton.dev/categories: Deployment
+spec:
+  description: >-
+    Updates an Argo CD Application's targetRevision to point to a
+    newly pushed OCI artifact. This replaces Kokumi's Serving CRD
+    activation — instead of managing a Serving resource, the pipeline
+    directly patches the Application to deploy the new revision.
+    Supports both automatic promotion (always update) and manual
+    mode (skip if PROMOTE is false).
+  params:
+    - name: APP_NAME
+      description: Name of the Argo CD Application to update.
+      type: string
+    - name: APP_NAMESPACE
+      description: Namespace of the Argo CD Application.
+      type: string
+      default: "argocd"
+    - name: TARGET_REVISION
+      description: >-
+        New targetRevision to set on the Application source.
+        Typically the tag or content-addressable tag from oci-push.
+      type: string
+    - name: PROMOTE
+      description: >-
+        Set to "true" to promote, "false" to skip. Enables
+        manual promotion workflows where the pipeline runs but
+        deployment requires explicit approval.
+      type: string
+      default: "true"
+    - name: SYNC_AFTER_PROMOTE
+      description: >-
+        Set to "true" to trigger a sync after updating the
+        targetRevision via a refresh annotation.
+      type: string
+      default: "false"
+    - name: SET_SYNC_POLICY
+      description: >-
+        Set to "true" to configure the Application's sync policy
+        (automated, prune, selfHeal). Matches Kokumi's Serving
+        behavior where the Application is fully configured.
+      type: string
+      default: "false"
+    - name: SYNC_POLICY_PRUNE
+      description: >-
+        Enable automated pruning of resources no longer in source.
+        Only used when SET_SYNC_POLICY is "true".
+      type: string
+      default: "true"
+    - name: SYNC_POLICY_SELF_HEAL
+      description: >-
+        Enable self-healing (auto-correct live state drift).
+        Only used when SET_SYNC_POLICY is "true".
+      type: string
+      default: "true"
+  results:
+    - name: PROMOTED
+      description: Whether the Application was actually updated ("true" or "false").
+    - name: PREVIOUS_REVISION
+      description: The targetRevision before promotion (for rollback reference).
+  steps:
+    - name: promote
+      image: bitnami/kubectl:1.30
+      env:
+        - name: APP_NAME
+          value: $(params.APP_NAME)
+        - name: APP_NAMESPACE
+          value: $(params.APP_NAMESPACE)
+        - name: TARGET_REVISION
+          value: $(params.TARGET_REVISION)
+        - name: PROMOTE
+          value: $(params.PROMOTE)
+        - name: SYNC_AFTER_PROMOTE
+          value: $(params.SYNC_AFTER_PROMOTE)
+        - name: SET_SYNC_POLICY
+          value: $(params.SET_SYNC_POLICY)
+        - name: SYNC_POLICY_PRUNE
+          value: $(params.SYNC_POLICY_PRUNE)
+        - name: SYNC_POLICY_SELF_HEAL
+          value: $(params.SYNC_POLICY_SELF_HEAL)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        if [ "${PROMOTE}" != "true" ]; then
+          echo "Promotion skipped (PROMOTE=${PROMOTE})."
+          printf "false" > "$(results.PROMOTED.path)"
+          printf "" > "$(results.PREVIOUS_REVISION.path)"
+          exit 0
+        fi
+
+        # Get the current targetRevision for rollback reference
+        PREVIOUS=$(kubectl get application "${APP_NAME}" \
+          -n "${APP_NAMESPACE}" \
+          -o jsonpath='{.spec.source.targetRevision}' 2>/dev/null || echo "")
+
+        printf "%s" "${PREVIOUS}" > "$(results.PREVIOUS_REVISION.path)"
+
+        if [ "${PREVIOUS}" = "${TARGET_REVISION}" ]; then
+          echo "Application ${APP_NAME} already at revision ${TARGET_REVISION}, skipping."
+          printf "false" > "$(results.PROMOTED.path)"
+          exit 0
+        fi
+
+        echo "Promoting ${APP_NAME}: ${PREVIOUS} -> ${TARGET_REVISION}"
+
+        # Patch the Application's targetRevision
+        kubectl patch application "${APP_NAME}" \
+          -n "${APP_NAMESPACE}" \
+          --type merge \
+          -p "{\"spec\":{\"source\":{\"targetRevision\":\"${TARGET_REVISION}\"}}}"
+
+        printf "true" > "$(results.PROMOTED.path)"
+        echo "Application ${APP_NAME} updated to revision ${TARGET_REVISION}."
+
+        # Optionally set sync policy (automated, prune, selfHeal)
+        if [ "${SET_SYNC_POLICY}" = "true" ]; then
+          echo "Configuring sync policy..."
+          PRUNE_FLAG="false"
+          SELFHEAL_FLAG="false"
+          if [ "${SYNC_POLICY_PRUNE}" = "true" ]; then PRUNE_FLAG="true"; fi
+          if [ "${SYNC_POLICY_SELF_HEAL}" = "true" ]; then SELFHEAL_FLAG="true"; fi
+
+          kubectl patch application "${APP_NAME}" \
+            -n "${APP_NAMESPACE}" \
+            --type merge \
+            -p "{\"spec\":{\"syncPolicy\":{\"automated\":{\"prune\":${PRUNE_FLAG},\"selfHeal\":${SELFHEAL_FLAG}}}}}"
+          echo "Sync policy set: automated=true, prune=${PRUNE_FLAG}, selfHeal=${SELFHEAL_FLAG}"
+        fi
+
+        # Optionally trigger a sync via annotation refresh
+        if [ "${SYNC_AFTER_PROMOTE}" = "true" ]; then
+          echo "Triggering sync via refresh annotation..."
+          kubectl patch application "${APP_NAME}" \
+            -n "${APP_NAMESPACE}" \
+            --type merge \
+            -p "{\"metadata\":{\"annotations\":{\"argocd.argoproj.io/refresh\":\"normal\"}}}"
+          echo "Sync triggered."
+        fi

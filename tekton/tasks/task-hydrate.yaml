@@ -1,0 +1,190 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: hydrate-manifests
+  labels:
+    app.kubernetes.io/version: "0.2"
+  annotations:
+    tekton.dev/displayName: "Hydrate Manifests"
+    tekton.dev/categories: Build Tools
+spec:
+  description: >-
+    Renders dry Kubernetes manifests using Helm or Kustomize.
+    Outputs hydrated YAML to a _rendered/ subdirectory within
+    the source workspace.
+  workspaces:
+    - name: source
+      description: >-
+        Workspace containing the cloned git repository. Rendered
+        manifests are written to a _rendered/ subdirectory.
+  params:
+    - name: HYDRATION_METHOD
+      description: "Hydration tool to use: 'helm' or 'kustomize'."
+      type: string
+    - name: HELM_CHART_PATH
+      description: >-
+        Path to the Helm chart directory within the repo
+        (relative to workspace root). Used when HYDRATION_METHOD=helm.
+      type: string
+      default: "."
+    - name: HELM_RELEASE_NAME
+      description: >-
+        Helm release name for 'helm template'.
+        Used when HYDRATION_METHOD=helm.
+      type: string
+      default: "release"
+    - name: HELM_NAMESPACE
+      description: >-
+        Target Kubernetes namespace passed to helm template --namespace.
+        Used when HYDRATION_METHOD=helm.
+      type: string
+      default: "default"
+    - name: HELM_VALUES_FILE
+      description: >-
+        Path to a Helm values file (relative to workspace root).
+        Leave empty to skip. Used when HYDRATION_METHOD=helm.
+      type: string
+      default: ""
+    - name: HELM_VALUES
+      description: >-
+        Inline YAML values written to a temp file and passed via -f.
+        Leave empty to skip. Used when HYDRATION_METHOD=helm.
+      type: string
+      default: ""
+    - name: HELM_INCLUDE_CRDS
+      description: >-
+        Set to "true" to include CRDs in Helm template output,
+        "false" to exclude. Used when HYDRATION_METHOD=helm.
+      type: string
+      default: "true"
+    - name: HELM_SKIP_TESTS
+      description: >-
+        Set to "true" to skip test hooks in Helm template output.
+        Used when HYDRATION_METHOD=helm.
+      type: string
+      default: "true"
+    - name: KUSTOMIZE_PATH
+      description: >-
+        Path to the kustomization directory within the repo
+        (relative to workspace root). Used when HYDRATION_METHOD=kustomize.
+      type: string
+      default: "."
+    - name: OUTPUT_DIR
+      description: >-
+        Subdirectory name within the workspace for rendered output.
+      type: string
+      default: "_rendered"
+  results:
+    - name: MANIFEST_SHA
+      description: SHA-256 digest of the rendered manifests file.
+  steps:
+    - name: render
+      image: alpine/k8s:1.30.2
+      env:
+        - name: HYDRATION_METHOD
+          value: $(params.HYDRATION_METHOD)
+        - name: HELM_CHART_PATH
+          value: $(params.HELM_CHART_PATH)
+        - name: HELM_RELEASE_NAME
+          value: $(params.HELM_RELEASE_NAME)
+        - name: HELM_NAMESPACE
+          value: $(params.HELM_NAMESPACE)
+        - name: HELM_VALUES_FILE
+          value: $(params.HELM_VALUES_FILE)
+        - name: HELM_VALUES
+          value: $(params.HELM_VALUES)
+        - name: HELM_INCLUDE_CRDS
+          value: $(params.HELM_INCLUDE_CRDS)
+        - name: HELM_SKIP_TESTS
+          value: $(params.HELM_SKIP_TESTS)
+        - name: KUSTOMIZE_PATH
+          value: $(params.KUSTOMIZE_PATH)
+        - name: OUTPUT_DIR
+          value: $(params.OUTPUT_DIR)
+        - name: WORKSPACE_PATH
+          value: $(workspaces.source.path)
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+
+        RENDER_DIR="${WORKSPACE_PATH}/${OUTPUT_DIR}"
+        mkdir -p "${RENDER_DIR}"
+
+        case "${HYDRATION_METHOD}" in
+          helm)
+            echo "Rendering with Helm template..."
+            CHART_FULL_PATH="${WORKSPACE_PATH}/${HELM_CHART_PATH}"
+
+            if [ ! -f "${CHART_FULL_PATH}/Chart.yaml" ]; then
+              echo "ERROR: Chart.yaml not found at ${CHART_FULL_PATH}"
+              exit 1
+            fi
+
+            # Build dependencies if needed
+            if [ -f "${CHART_FULL_PATH}/Chart.lock" ] || \
+               grep -q "dependencies:" "${CHART_FULL_PATH}/Chart.yaml" 2>/dev/null; then
+              echo "Building Helm dependencies..."
+              helm dependency build "${CHART_FULL_PATH}"
+            fi
+
+            HELM_CMD="helm template ${HELM_RELEASE_NAME} ${CHART_FULL_PATH}"
+            HELM_CMD="${HELM_CMD} --namespace ${HELM_NAMESPACE}"
+
+            if [ "${HELM_INCLUDE_CRDS}" = "true" ]; then
+              HELM_CMD="${HELM_CMD} --include-crds"
+            fi
+            if [ "${HELM_SKIP_TESTS}" = "true" ]; then
+              HELM_CMD="${HELM_CMD} --skip-tests"
+            fi
+
+            if [ -n "${HELM_VALUES_FILE}" ]; then
+              VALUES_FULL_PATH="${WORKSPACE_PATH}/${HELM_VALUES_FILE}"
+              if [ ! -f "${VALUES_FULL_PATH}" ]; then
+                echo "ERROR: Values file not found at ${VALUES_FULL_PATH}"
+                exit 1
+              fi
+              HELM_CMD="${HELM_CMD} -f ${VALUES_FULL_PATH}"
+            fi
+
+            if [ -n "${HELM_VALUES}" ]; then
+              INLINE_VALUES_FILE="/tmp/inline-values.yaml"
+              printf '%s' "${HELM_VALUES}" > "${INLINE_VALUES_FILE}"
+              HELM_CMD="${HELM_CMD} -f ${INLINE_VALUES_FILE}"
+            fi
+
+            echo "Running: ${HELM_CMD}"
+            eval ${HELM_CMD} > "${RENDER_DIR}/manifests.yaml"
+            ;;
+
+          kustomize)
+            echo "Rendering with Kustomize build..."
+            KUSTOMIZE_FULL_PATH="${WORKSPACE_PATH}/${KUSTOMIZE_PATH}"
+
+            if [ ! -f "${KUSTOMIZE_FULL_PATH}/kustomization.yaml" ] && \
+               [ ! -f "${KUSTOMIZE_FULL_PATH}/kustomization.yml" ] && \
+               [ ! -f "${KUSTOMIZE_FULL_PATH}/Kustomization" ]; then
+              echo "ERROR: No kustomization file found at ${KUSTOMIZE_FULL_PATH}"
+              exit 1
+            fi
+
+            kustomize build "${KUSTOMIZE_FULL_PATH}" > "${RENDER_DIR}/manifests.yaml"
+            ;;
+
+          *)
+            echo "ERROR: Unknown HYDRATION_METHOD '${HYDRATION_METHOD}'. Must be 'helm' or 'kustomize'."
+            exit 1
+            ;;
+        esac
+
+        if [ ! -s "${RENDER_DIR}/manifests.yaml" ]; then
+          echo "ERROR: Rendered manifests file is empty."
+          exit 1
+        fi
+
+        MANIFEST_SIZE=$(wc -c < "${RENDER_DIR}/manifests.yaml" | tr -d ' ')
+        echo "Rendered manifests: ${MANIFEST_SIZE} bytes"
+
+        MANIFEST_SHA=$(sha256sum "${RENDER_DIR}/manifests.yaml" | cut -d' ' -f1)
+        printf "%s" "${MANIFEST_SHA}" > "$(results.MANIFEST_SHA.path)"
+
+        echo "Manifest SHA-256: ${MANIFEST_SHA}"

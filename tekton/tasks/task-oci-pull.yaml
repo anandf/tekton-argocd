@@ -1,0 +1,88 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: oci-pull
+  labels:
+    app.kubernetes.io/version: "0.1"
+  annotations:
+    tekton.dev/displayName: "OCI Pull"
+    tekton.dev/categories: Image Build
+spec:
+  description: >-
+    Pulls an OCI artifact from a container registry and extracts its
+    contents into a workspace. Enables OCI-to-OCI transformation
+    pipelines where the source is an existing OCI artifact rather
+    than a git repository.
+  workspaces:
+    - name: output
+      description: >-
+        The pulled artifact contents are extracted here. Uses the
+        same workspace name as git-clone so the pipeline can swap
+        between git and OCI sources transparently.
+  params:
+    - name: SOURCE_IMAGE_REF
+      description: >-
+        Full OCI image reference to pull, e.g.
+        registry.example.com/charts/my-app:v1.0.0 or
+        registry.example.com/charts/my-app@sha256:abc123...
+      type: string
+  results:
+    - name: digest
+      description: The resolved digest (sha256:...) of the pulled artifact.
+    - name: source-ref
+      description: The image reference that was pulled.
+  steps:
+    - name: pull
+      image: ghcr.io/oras-project/oras:v1.2.0
+      env:
+        - name: SOURCE_IMAGE_REF
+          value: $(params.SOURCE_IMAGE_REF)
+        - name: WORKSPACE_PATH
+          value: $(workspaces.output.path)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        echo "Pulling OCI artifact: ${SOURCE_IMAGE_REF}"
+
+        # Pull artifact contents into workspace
+        cd "${WORKSPACE_PATH}"
+        OUTPUT=$(oras pull "${SOURCE_IMAGE_REF}" 2>&1)
+        echo "${OUTPUT}"
+
+        # Resolve the digest
+        DIGEST=$(oras manifest fetch "${SOURCE_IMAGE_REF}" --descriptor 2>&1 | grep -oE '"digest":"sha256:[a-f0-9]{64}"' | head -1 | sed 's/"digest":"//;s/"//')
+
+        if [ -z "${DIGEST}" ]; then
+          DIGEST=$(echo "${OUTPUT}" | grep -oE 'sha256:[a-f0-9]{64}' | head -1)
+        fi
+
+        # If pulled content is a tar or tar.gz, extract it
+        for ARCHIVE in "${WORKSPACE_PATH}"/*.tar.gz "${WORKSPACE_PATH}"/*.tgz; do
+          if [ -f "${ARCHIVE}" ]; then
+            echo "Extracting archive: ${ARCHIVE}"
+            tar -xzf "${ARCHIVE}" -C "${WORKSPACE_PATH}"
+            rm -f "${ARCHIVE}"
+          fi
+        done
+        for ARCHIVE in "${WORKSPACE_PATH}"/*.tar; do
+          if [ -f "${ARCHIVE}" ]; then
+            echo "Extracting archive: ${ARCHIVE}"
+            tar -xf "${ARCHIVE}" -C "${WORKSPACE_PATH}"
+            rm -f "${ARCHIVE}"
+          fi
+        done
+
+        # List extracted contents
+        FILE_COUNT=$(find "${WORKSPACE_PATH}" -type f | wc -l | tr -d ' ')
+        echo "Extracted ${FILE_COUNT} file(s) to workspace."
+
+        if [ "${FILE_COUNT}" = "0" ]; then
+          echo "ERROR: No files found after pulling and extracting artifact."
+          exit 1
+        fi
+
+        printf "%s" "${DIGEST}" > "$(results.digest.path)"
+        printf "%s" "${SOURCE_IMAGE_REF}" > "$(results.source-ref.path)"
+
+        echo "Pulled ${SOURCE_IMAGE_REF} @ ${DIGEST}"

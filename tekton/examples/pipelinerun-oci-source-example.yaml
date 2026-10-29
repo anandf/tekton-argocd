@@ -1,0 +1,68 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: hydrate-oci-
+  labels:
+    tekton.dev/pipeline: oci-hydrate-and-push
+spec:
+  pipelineRef:
+    name: oci-hydrate-and-push
+  taskRunTemplate:
+    serviceAccountName: tekton-oci-push
+  workspaces:
+    - name: shared-workspace
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1Gi
+  params:
+    # Pull a Helm chart from an OCI registry as the source
+    - name: oci-source-ref
+      value: "registry.example.com/charts/my-app:v1.0.0"
+    - name: hydration-method
+      value: "helm"
+    - name: helm-chart-path
+      value: "."
+    - name: helm-release-name
+      value: "my-app"
+    - name: helm-namespace
+      value: "production"
+    - name: helm-include-crds
+      value: "true"
+    - name: helm-skip-tests
+      value: "true"
+    - name: image-ref
+      value: "registry.example.com/manifests/my-app:v1.0.0-hydrated"
+    - name: extra-tags
+      value: "latest"
+    - name: commit-message
+      value: "Hydrated from OCI chart v1.0.0"
+    # Apply patches to the rendered output
+    - name: patches
+      value: |
+        [
+          {
+            "target": {"kind": "Service", "name": "my-app"},
+            "set": {
+              ".spec.type": "LoadBalancer"
+            }
+          }
+        ]
+    - name: renderer-type
+      value: "helm"
+    # Sign and auto-promote
+    - name: sign
+      value: "true"
+    - name: signing-mode
+      value: "keyless"
+    - name: promote
+      value: "true"
+    - name: promote-app-name
+      value: "my-app"
+    - name: promote-app-namespace
+      value: "argocd"
+    - name: set-sync-policy
+      value: "true"

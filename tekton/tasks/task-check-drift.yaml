@@ -1,0 +1,131 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: check-drift
+  labels:
+    app.kubernetes.io/version: "0.1"
+  annotations:
+    tekton.dev/displayName: "Check Drift"
+    tekton.dev/categories: Build Tools
+spec:
+  description: >-
+    Computes a config hash from pipeline inputs and checks whether
+    an OCI artifact with that hash already exists in the registry.
+    If it exists, the output CHANGED result is "false", allowing
+    downstream tasks to be skipped via Tekton 'when' expressions.
+    This implements Kokumi's drift detection — avoiding unnecessary
+    re-rendering when nothing has changed.
+  params:
+    - name: IMAGE_BASE
+      description: >-
+        Base OCI image path (without tag), e.g.
+        registry.example.com/manifests/my-app
+      type: string
+    - name: HYDRATION_METHOD
+      description: Hydration method (helm or kustomize).
+      type: string
+    - name: HELM_CHART_PATH
+      description: Path to Helm chart.
+      type: string
+      default: "."
+    - name: HELM_RELEASE_NAME
+      description: Helm release name.
+      type: string
+      default: "release"
+    - name: HELM_NAMESPACE
+      description: Helm target namespace.
+      type: string
+      default: "default"
+    - name: HELM_VALUES_FILE
+      description: Path to Helm values file.
+      type: string
+      default: ""
+    - name: HELM_VALUES
+      description: Inline Helm values.
+      type: string
+      default: ""
+    - name: KUSTOMIZE_PATH
+      description: Path to kustomization directory.
+      type: string
+      default: "."
+    - name: PATCHES
+      description: JSON array of patches.
+      type: string
+      default: "[]"
+    - name: SOURCE_REVISION
+      description: >-
+        Source revision (git commit SHA or OCI digest). Included in
+        the config hash to detect source changes.
+      type: string
+      default: ""
+  results:
+    - name: CHANGED
+      description: >-
+        "true" if config has changed (artifact doesn't exist),
+        "false" if identical artifact already exists in registry.
+    - name: CONFIG_HASH
+      description: >-
+        SHA-256 hash of the canonicalized pipeline configuration.
+    - name: EXISTING_TAG
+      description: >-
+        The content-addressable tag that was checked. Empty if
+        no match was found.
+  steps:
+    - name: check
+      image: ghcr.io/oras-project/oras:v1.2.0
+      env:
+        - name: IMAGE_BASE
+          value: $(params.IMAGE_BASE)
+        - name: HYDRATION_METHOD
+          value: $(params.HYDRATION_METHOD)
+        - name: HELM_CHART_PATH
+          value: $(params.HELM_CHART_PATH)
+        - name: HELM_RELEASE_NAME
+          value: $(params.HELM_RELEASE_NAME)
+        - name: HELM_NAMESPACE
+          value: $(params.HELM_NAMESPACE)
+        - name: HELM_VALUES_FILE
+          value: $(params.HELM_VALUES_FILE)
+        - name: HELM_VALUES
+          value: $(params.HELM_VALUES)
+        - name: KUSTOMIZE_PATH
+          value: $(params.KUSTOMIZE_PATH)
+        - name: PATCHES
+          value: $(params.PATCHES)
+        - name: SOURCE_REVISION
+          value: $(params.SOURCE_REVISION)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        # Build a canonical config string from all inputs that affect the output.
+        # If any of these change, the artifact should be re-rendered.
+        CONFIG_INPUT="method=${HYDRATION_METHOD}"
+        CONFIG_INPUT="${CONFIG_INPUT}|chart_path=${HELM_CHART_PATH}"
+        CONFIG_INPUT="${CONFIG_INPUT}|release=${HELM_RELEASE_NAME}"
+        CONFIG_INPUT="${CONFIG_INPUT}|namespace=${HELM_NAMESPACE}"
+        CONFIG_INPUT="${CONFIG_INPUT}|values_file=${HELM_VALUES_FILE}"
+        CONFIG_INPUT="${CONFIG_INPUT}|values=${HELM_VALUES}"
+        CONFIG_INPUT="${CONFIG_INPUT}|kustomize_path=${KUSTOMIZE_PATH}"
+        CONFIG_INPUT="${CONFIG_INPUT}|patches=${PATCHES}"
+        CONFIG_INPUT="${CONFIG_INPUT}|source=${SOURCE_REVISION}"
+
+        CONFIG_HASH=$(printf '%s' "${CONFIG_INPUT}" | sha256sum | cut -d' ' -f1)
+        printf "%s" "${CONFIG_HASH}" > "$(results.CONFIG_HASH.path)"
+
+        SHORT_HASH=$(echo "${CONFIG_HASH}" | cut -c1-12)
+        CONTENT_TAG="cfg-${SHORT_HASH}"
+        printf "%s" "${CONTENT_TAG}" > "$(results.EXISTING_TAG.path)"
+
+        echo "Config hash: ${CONFIG_HASH}"
+        echo "Checking for existing artifact: ${IMAGE_BASE}:${CONTENT_TAG}"
+
+        # Check if an artifact with this config hash tag already exists
+        if oras manifest fetch "${IMAGE_BASE}:${CONTENT_TAG}" > /dev/null 2>&1; then
+          echo "Artifact already exists at ${IMAGE_BASE}:${CONTENT_TAG}"
+          echo "No changes detected — downstream tasks can be skipped."
+          printf "false" > "$(results.CHANGED.path)"
+        else
+          echo "No existing artifact found. Config has changed."
+          printf "true" > "$(results.CHANGED.path)"
+        fi

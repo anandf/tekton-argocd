@@ -1,0 +1,116 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: cosign-sign
+  labels:
+    app.kubernetes.io/version: "0.1"
+  annotations:
+    tekton.dev/displayName: "Cosign Sign"
+    tekton.dev/categories: Security
+spec:
+  description: >-
+    Signs an OCI artifact using cosign. Supports both key-based
+    signing (provide a cosign private key) and keyless signing
+    via Sigstore Fulcio/Rekor. The signature is stored alongside
+    the artifact in the OCI registry.
+  workspaces:
+    - name: cosign-key
+      description: >-
+        Optional workspace containing the cosign private key file
+        (cosign.key). Not needed for keyless signing.
+      optional: true
+  params:
+    - name: IMAGE_REF
+      description: >-
+        Full OCI image reference to sign, e.g.
+        registry.example.com/manifests/my-app:v1.0.0
+      type: string
+    - name: IMAGE_DIGEST
+      description: >-
+        Digest of the artifact to sign (sha256:...). Signing by
+        digest ensures the exact artifact is signed.
+      type: string
+    - name: SIGNING_MODE
+      description: >-
+        "key" for key-based signing (requires cosign-key workspace),
+        "keyless" for Sigstore Fulcio/Rekor keyless signing.
+      type: string
+      default: "keyless"
+    - name: COSIGN_KEY_FILE
+      description: >-
+        Filename of the cosign private key within the cosign-key
+        workspace. Only used when SIGNING_MODE=key.
+      type: string
+      default: "cosign.key"
+    - name: REKOR_URL
+      description: Rekor transparency log URL for keyless signing.
+      type: string
+      default: "https://rekor.sigstore.dev"
+    - name: FULCIO_URL
+      description: Fulcio CA URL for keyless signing.
+      type: string
+      default: "https://fulcio.sigstore.dev"
+  results:
+    - name: SIGNED
+      description: Whether the artifact was successfully signed ("true" or "false").
+  steps:
+    - name: sign
+      image: gcr.io/projectsigstore/cosign:v2.4.1
+      env:
+        - name: IMAGE_REF
+          value: $(params.IMAGE_REF)
+        - name: IMAGE_DIGEST
+          value: $(params.IMAGE_DIGEST)
+        - name: SIGNING_MODE
+          value: $(params.SIGNING_MODE)
+        - name: COSIGN_KEY_FILE
+          value: $(params.COSIGN_KEY_FILE)
+        - name: REKOR_URL
+          value: $(params.REKOR_URL)
+        - name: FULCIO_URL
+          value: $(params.FULCIO_URL)
+      script: |
+        #!/busybox/sh
+        set -eu
+
+        # Build the image reference with digest for signing
+        BASE_IMAGE=$(echo "${IMAGE_REF}" | sed 's/:[^:]*$//')
+        SIGN_REF="${BASE_IMAGE}@${IMAGE_DIGEST}"
+
+        echo "Signing artifact: ${SIGN_REF}"
+        echo "Signing mode: ${SIGNING_MODE}"
+
+        case "${SIGNING_MODE}" in
+          key)
+            KEY_PATH="$(workspaces.cosign-key.path)/${COSIGN_KEY_FILE}"
+            if [ ! -f "${KEY_PATH}" ]; then
+              echo "ERROR: Cosign key not found at ${KEY_PATH}"
+              printf "false" > "$(results.SIGNED.path)"
+              exit 1
+            fi
+
+            echo "Signing with key: ${KEY_PATH}"
+            cosign sign --key "${KEY_PATH}" \
+              --yes \
+              "${SIGN_REF}"
+            ;;
+
+          keyless)
+            echo "Signing with keyless mode (Fulcio + Rekor)..."
+            export COSIGN_EXPERIMENTAL=1
+            cosign sign \
+              --yes \
+              --fulcio-url="${FULCIO_URL}" \
+              --rekor-url="${REKOR_URL}" \
+              "${SIGN_REF}"
+            ;;
+
+          *)
+            echo "ERROR: Unknown SIGNING_MODE '${SIGNING_MODE}'. Must be 'key' or 'keyless'."
+            printf "false" > "$(results.SIGNED.path)"
+            exit 1
+            ;;
+        esac
+
+        printf "true" > "$(results.SIGNED.path)"
+        echo "Artifact signed successfully."
